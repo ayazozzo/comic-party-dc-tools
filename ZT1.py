@@ -1,22 +1,29 @@
 """
 ZT1 <-> PNG converter (compressed PVR images).
 
-Suport Comic Party,Dreamcast,2001,ZT1 file
+Support Comic Party,Dreamcast,2001,ZT1 file
 
 ZT1 file layout:
-  - 16-byte header:
-      bytes 0-3:   "ZT10" magic
-      bytes 4-7:   u32 LE = deflate stream length (compressed_len - 6)
-      bytes 8-15:  u64 LE = decompressed payload length
-  - zlib-compressed payload containing concatenated PVR files
+  - ZT10 (640x512 UI canvas):
+      16-byte header: "ZT10" + u32(compressed_len-6) + u64(decompressed_len)
+      then zlib-compressed payload (concatenated PVR files).
+  - ZT11 / ZT12 (character tachi-e, e.g. ASA01_1.ZT1 / BAN01_1.ZT1):
+      16-byte header: "ZT1x" + u32(compressed_len) + u32(decompressed_len)
+                      + u32(metadata_table_len)
+      then metadata_table (metadata_table_len bytes; not needed for decode)
+      then zlib-compressed payload (concatenated PVR files, ARGB4444).
+      file is zero-padded to a multiple of 4.
 
 Each PVR file:
   - 16-byte GBIX section: "GBIX" + u32(8) + u64(global_index)
   - 16-byte PVRT header: "PVRT" + u32(size_field) + 4-byte type + u16(width) + u16(height)
       size_field = 8 + pixel_data_length
-  - Pixel data (width*height*2 bytes, RGB565 square-twiddled Morton order)
+  - Pixel data (width*height*2 bytes, square-twiddled Morton order)
 
-Type byte 1 = 0x01 (RGB565), Type byte 2 = 0x01 (SQUARE TWIDDLED).
+Pixel format is determined by type_field[0]:
+  0x01 = RGB565  (ZT10 files)
+  0x02 = ARGB4444 (ZT11 / ZT12 tachi-e files, e.g. character 立绘)
+type_field[1] = 0x01 (SQUARE TWIDDLED) for all supported files.
 
 Usage:
   python zt1.py d filename.zt1   -> decode to filename.png
@@ -58,20 +65,38 @@ def build_morton_lut(size):
     return lut
 
 
-def rgb565_to_rgb888(pixel_arr):
-    """Convert RGB565 (LE 2-byte) pixel array to RGB888."""
+def rgb565_to_rgba8888(pixel_arr):
+    """Convert RGB565 (LE 2-byte) pixel array to RGBA8888 (alpha = 255)."""
     vals = (pixel_arr[:, :, 1].astype(np.uint32) << 8) | pixel_arr[:, :, 0].astype(np.uint32)
     r5 = ((vals >> 11) & 0x1F) * 255 // 31
     g6 = ((vals >> 5) & 0x3F) * 255 // 63
     b5 = (vals & 0x1F) * 255 // 31
-    return np.stack([r5.astype(np.uint8), g6.astype(np.uint8), b5.astype(np.uint8)], axis=-1)
+    a8 = np.full(r5.shape, 255, dtype=np.uint8)
+    return np.stack([r5.astype(np.uint8), g6.astype(np.uint8),
+                     b5.astype(np.uint8), a8], axis=-1)
 
 
-def rgb888_to_rgb565(rgb):
-    """Convert RGB888 array (H, W, 3) to RGB565 little-endian bytes (H, W, 2)."""
-    r = rgb[:, :, 0].astype(np.uint32)
-    g = rgb[:, :, 1].astype(np.uint32)
-    b = rgb[:, :, 2].astype(np.uint32)
+def argb4444_to_rgba8888(pixel_arr):
+    """Convert ARGB4444 (LE 2-byte) pixel array to RGBA8888 (alpha preserved)."""
+    vals = (pixel_arr[:, :, 1].astype(np.uint32) << 8) | pixel_arr[:, :, 0].astype(np.uint32)
+    a4 = (vals >> 12) & 0xF
+    r4 = (vals >> 8) & 0xF
+    g4 = (vals >> 4) & 0xF
+    b4 = vals & 0xF
+    # 4-bit -> 8-bit: replicate nibble (v*17)
+    return np.stack([
+        (r4 * 17).astype(np.uint8),
+        (g4 * 17).astype(np.uint8),
+        (b4 * 17).astype(np.uint8),
+        (a4 * 17).astype(np.uint8),
+    ], axis=-1)
+
+
+def rgba8888_to_rgb565(rgba):
+    """Convert RGBA8888 array (H, W, 4) to RGB565 little-endian bytes (H, W, 2)."""
+    r = rgba[:, :, 0].astype(np.uint32)
+    g = rgba[:, :, 1].astype(np.uint32)
+    b = rgba[:, :, 2].astype(np.uint32)
     r5 = (r * 31 // 255) & 0x1F
     g6 = (g * 63 // 255) & 0x3F
     b5 = (b * 31 // 255) & 0x1F
@@ -79,6 +104,37 @@ def rgb888_to_rgb565(rgb):
     low = (val & 0xFF).astype(np.uint8)
     high = ((val >> 8) & 0xFF).astype(np.uint8)
     return np.stack([low, high], axis=-1)
+
+
+def rgba8888_to_argb4444(rgba):
+    """Convert RGBA8888 array (H, W, 4) to ARGB4444 little-endian bytes (H, W, 2).
+    Alpha is quantized from 8-bit to 4-bit (v * 15 // 255).
+    """
+    r = rgba[:, :, 0].astype(np.uint32)
+    g = rgba[:, :, 1].astype(np.uint32)
+    b = rgba[:, :, 2].astype(np.uint32)
+    a = rgba[:, :, 3].astype(np.uint32)
+    a4 = (a * 15 // 255) & 0xF
+    r4 = (r * 15 // 255) & 0xF
+    g4 = (g * 15 // 255) & 0xF
+    b4 = (b * 15 // 255) & 0xF
+    val = (a4 << 12) | (r4 << 8) | (g4 << 4) | b4
+    low = (val & 0xFF).astype(np.uint8)
+    high = ((val >> 8) & 0xFF).astype(np.uint8)
+    return np.stack([low, high], axis=-1)
+
+
+# PVR pixel format identifiers (type_field[0])
+FMT_RGB565 = 0x01
+FMT_ARGB4444 = 0x02
+
+
+def pvr_to_rgba8888(pixel_arr, fmt):
+    """Dispatch to the right 2bpp -> RGBA8888 converter based on pixel format byte."""
+    if fmt == FMT_ARGB4444:
+        return argb4444_to_rgba8888(pixel_arr)
+    # default / FMT_RGB565
+    return rgb565_to_rgba8888(pixel_arr)
 
 
 def untwiddle(pixel_bytes, size):
@@ -135,11 +191,17 @@ def parse_pvrs(decompressed):
     return pvrs
 
 
-def build_pvr(width, height, pixel_data_twiddled, global_index=0):
-    """Build a single PVR file (GBIX + PVRT header + pixel data)."""
+def build_pvr(width, height, pixel_data_twiddled, global_index=0,
+              pixel_format=FMT_RGB565):
+    """Build a single PVR file (GBIX + PVRT header + pixel data).
+
+    pixel_format is the PVR pixel format byte (type_field[0]):
+      FMT_RGB565 (0x01) or FMT_ARGB4444 (0x02).
+    Twiddle mode is always SQUARE TWIDDLED (0x01).
+    """
     gbix = b'GBIX' + struct.pack('<I', 8) + struct.pack('<Q', global_index)
     size_field = 8 + len(pixel_data_twiddled)
-    type_field = bytes([0x01, 0x01, 0x00, 0x00])  # RGB565 + SQUARE TWIDDLED
+    type_field = bytes([pixel_format, 0x01, 0x00, 0x00])
     header = (b'PVRT' + struct.pack('<I', size_field) + type_field
               + struct.pack('<HH', width, height))
     return gbix + header + pixel_data_twiddled
@@ -155,60 +217,85 @@ def decode_zt1(zt1_path, png_path):
         data = f.read()
 
     magic = data[:4]
-    if magic != b'ZT10':
-        raise ValueError(f'Bad magic: {magic!r}, expected b"ZT10"')
+    if magic not in (b'ZT10', b'ZT11', b'ZT12'):
+        raise ValueError(f'Bad magic: {magic!r}, expected b"ZT10"/b"ZT11"/b"ZT12"')
 
-    decompressed = zlib.decompress(data[16:])
-    print(f'ZT1 size: {len(data)}, decompressed: {len(decompressed)}')
+    if magic == b'ZT10':
+        # ZT10: 16-byte header, zlib stream starts at offset 16
+        payload_offset = 16
+    else:
+        # ZT11 / ZT12: 16-byte header + metadata table (length at offset 12)
+        metadata_len = struct.unpack('<I', data[12:16])[0]
+        payload_offset = 16 + metadata_len
+
+    decompressed = zlib.decompress(data[payload_offset:])
+    print(f'ZT1 size: {len(data)}, magic={magic.decode("ascii", "replace")}, '
+          f'payload@{payload_offset}, decompressed: {len(decompressed)}')
 
     pvrs = parse_pvrs(decompressed)
     print(f'Found {len(pvrs)} PVR file(s):')
     for i, p in enumerate(pvrs):
+        fmt_name = {FMT_RGB565: 'RGB565', FMT_ARGB4444: 'ARGB4444'}.get(
+            p['type'][0], f'unknown(0x{p["type"][0]:02x})')
         print(f'  PVR {i}: {p["width"]}x{p["height"]} '
-              f'type={p["type"].hex()} pixel_data={len(p["pixel_data"])} bytes')
+              f'type={p["type"].hex()} ({fmt_name}) '
+              f'pixel_data={len(p["pixel_data"])} bytes')
 
     main = pvrs[0]
     main_w, main_h = main['width'], main['height']
+    main_fmt = main['type'][0]
 
+    # Layout: main PVR at top-left; sub PVRs stacked to the right (column)
+    # when there are multiple, or below (row) when there is only one.
+    # Supports mixed sub-PVR sizes (e.g. ZT12: 4x128x128 + 1x256x256).
     if len(pvrs) > 1:
-        sub_w = pvrs[1]['width']
-        sub_h = pvrs[1]['height']
-        sub_count = len(pvrs) - 1
-        if main_h == sub_h * sub_count or sub_count * sub_h >= main_h:
-            full_w = main_w + sub_w
-            full_h = main_h
+        if len(pvrs) == 2:
+            # Single sub PVR: place below the main image (ZT11 layout)
+            full_w = max(main_w, pvrs[1]['width'])
+            full_h = main_h + pvrs[1]['height']
         else:
-            full_w = main_w
-            full_h = main_h + sub_h
+            # Multiple sub PVRs: stack vertically in a right column
+            right_col_w = max(p['width'] for p in pvrs[1:])
+            right_col_h = sum(p['height'] for p in pvrs[1:])
+            full_w = main_w + right_col_w
+            full_h = max(main_h, right_col_h)
     else:
         full_w = main_w
         full_h = main_h
 
     print(f'Combined image: {full_w}x{full_h}')
 
-    output = np.zeros((full_h, full_w, 3), dtype=np.uint8)
+    output = np.zeros((full_h, full_w, 4), dtype=np.uint8)
 
     main_pixels = untwiddle(main['pixel_data'], main_w)
-    output[:main_h, :main_w] = rgb565_to_rgb888(main_pixels)
+    output[:main_h, :main_w] = pvr_to_rgba8888(main_pixels, main_fmt)
 
-    for i in range(1, len(pvrs)):
-        sub = pvrs[i]
+    if len(pvrs) == 2:
+        # Single sub: place at (0, main_h)
+        sub = pvrs[1]
         sw, sh = sub['width'], sub['height']
+        sub_fmt = sub['type'][0]
         sub_pixels = untwiddle(sub['pixel_data'], sw)
-        sub_rgb = rgb565_to_rgb888(sub_pixels)
+        sub_rgba = pvr_to_rgba8888(sub_pixels, sub_fmt)
+        output[main_h:main_h + sh, :sw] = sub_rgba
+    else:
+        # Multiple subs: stack vertically in right column starting at x=main_w
+        y_cursor = 0
+        for i in range(1, len(pvrs)):
+            sub = pvrs[i]
+            sw, sh = sub['width'], sub['height']
+            sub_fmt = sub['type'][0]
+            sub_pixels = untwiddle(sub['pixel_data'], sw)
+            sub_rgba = pvr_to_rgba8888(sub_pixels, sub_fmt)
+            output[y_cursor:y_cursor + sh, main_w:main_w + sw] = sub_rgba
+            y_cursor += sh
 
-        if full_w > main_w:
-            y0 = (i - 1) * sh
-            x0 = main_w
-        else:
-            y0 = main_h
-            x0 = (i - 1) * sw
-        output[y0:y0 + sh, x0:x0 + sw] = sub_rgb
-
-    if full_h > 480:
+    # ZT10 640x512 canvas reserves the bottom 32 rows for UI; ZT11 (tachi-e)
+    # uses the full main PVR height and should not be cropped.
+    if magic == b'ZT10' and full_h > 480:
         output = output[:480, :]
 
-    Image.fromarray(output, 'RGB').save(png_path)
+    Image.fromarray(output, 'RGBA').save(png_path)
     print(f'Saved {png_path} ({output.shape[1]}x{output.shape[0]})')
 
 
@@ -218,21 +305,21 @@ def decode_zt1(zt1_path, png_path):
 
 def encode_zt1(png_path, zt1_path):
     """Encode a PNG image to ZT1 format."""
-    img = Image.open(png_path).convert('RGB')
+    img = Image.open(png_path).convert('RGBA')
     arr = np.array(img)
     h, w = arr.shape[:2]
     print(f'PNG size: {w}x{h}')
 
     # Target canvas: 640x512 (PNG is 640x480, pad bottom 32 rows with white)
     full_w, full_h = 640, 512
-    padded = np.ones((full_h, full_w, 3), dtype=np.uint8) * 255
+    padded = np.ones((full_h, full_w, 4), dtype=np.uint8) * 255
     padded[:h, :w] = arr[:min(h, full_h), :min(w, full_w)]
 
     payload = b''
 
     # PVR 0: 512x512 main image (top-left)
     main = padded[:512, :512]
-    main_rgb565 = rgb888_to_rgb565(main)
+    main_rgb565 = rgba8888_to_rgb565(main)
     main_twiddled = twiddle(main_rgb565, 512)
     payload += build_pvr(512, 512, main_twiddled, global_index=0)
 
@@ -240,7 +327,7 @@ def encode_zt1(png_path, zt1_path):
     for i in range(4):
         y0 = i * 128
         sub = padded[y0:y0 + 128, 512:640]
-        sub_rgb565 = rgb888_to_rgb565(sub)
+        sub_rgb565 = rgba8888_to_rgb565(sub)
         sub_twiddled = twiddle(sub_rgb565, 128)
         payload += build_pvr(128, 128, sub_twiddled, global_index=0)
 
